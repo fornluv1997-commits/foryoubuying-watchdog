@@ -1,0 +1,99 @@
+name: SMS Gateway External Watchdog
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: external-watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SERVER_URL: ${{ secrets.SERVER_URL }}
+      MAX_SILENCE_SEC: "1800"
+      DOWN_RETRIES: "3"
+      DOWN_BACKOFF_SEC: "10"
+    steps:
+      - name: Probe /health with retry
+        id: probe
+        shell: bash
+        run: |
+          set +e
+          RESP="000"
+          BODY=""
+          for i in $(seq 1 "$DOWN_RETRIES"); do
+            RESP=$(curl -sS -m 15 -o /tmp/body.json -w "%{http_code}" "$SERVER_URL/health" 2>/dev/null)
+            if [ "$RESP" = "200" ]; then
+              BODY=$(cat /tmp/body.json)
+              break
+            fi
+            echo "attempt $i: http=$RESP"
+            sleep "$DOWN_BACKOFF_SEC"
+          done
+          echo "http_code=$RESP" >> "$GITHUB_OUTPUT"
+          echo "body=$BODY" >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram alert if down or stale
+        shell: bash
+        env:
+          HTTP_CODE: ${{ steps.probe.outputs.http_code }}
+          BODY: ${{ steps.probe.outputs.body }}
+        run: |
+          set -euo pipefail
+          NOW=$(date +%s)
+          NOW_ISO=$(date -u '+%Y-%m-%d %H:%M:%S')
+
+          send() {
+            local text="$1"
+            curl -sS -m 15 "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "parse_mode=HTML" \
+              --data-urlencode "disable_web_page_preview=true" \
+              --data-urlencode "text=${text}" \
+              -o /dev/null -w "telegram_http=%{http_code}\n"
+          }
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            TEXT=$(printf '%s' \
+              "🔴 <b>Oracle SMS Gateway DOWN</b>"$'\n\n' \
+              "GET ${SERVER_URL}/health → HTTP <code>${HTTP_CODE}</code>"$'\n' \
+              "재시도 ${DOWN_RETRIES}회 모두 실패 (${DOWN_BACKOFF_SEC}초 간격)"$'\n' \
+              "감지: ${NOW_ISO} UTC"$'\n\n' \
+              "<b>점검:</b>"$'\n' \
+              "• <code>oci compute instance get --instance-id ...</code>"$'\n' \
+              "• <code>ssh opc@151.145.74.5</code>"$'\n' \
+              "• Oracle Console reboot (SOFTRESET → RESET)")
+            send "$TEXT"
+            exit 1
+          fi
+
+          LAST_HB=$(echo "$BODY" | jq -r '.last_heartbeat // 0')
+          MAC_ALIVE=$(echo "$BODY" | jq -r '.mac_alive // false')
+          SILENCE=$((NOW - LAST_HB))
+
+          if [ "$LAST_HB" -gt 0 ] && [ "$SILENCE" -gt "$MAX_SILENCE_SEC" ]; then
+            MIN=$((SILENCE / 60))
+            TEXT=$(printf '%s' \
+              "🟡 <b>맥북 heartbeat 끊김</b>"$'\n\n' \
+              "침묵: <i>${MIN}분</i> (임계값 $((MAX_SILENCE_SEC/60))분)"$'\n' \
+              "mac_alive=${MAC_ALIVE}"$'\n' \
+              "감지: ${NOW_ISO} UTC"$'\n\n' \
+              "<b>점검:</b>"$'\n' \
+              "• 맥북 전원/이더넷"$'\n' \
+              "• <code>ssh fornl@10.228.2.2</code>"$'\n' \
+              "• <code>launchctl list | grep com.foryou</code>")
+            send "$TEXT"
+            exit 1
+          fi
+
+          echo "OK silence=${SILENCE}s mac_alive=${MAC_ALIVE}"
