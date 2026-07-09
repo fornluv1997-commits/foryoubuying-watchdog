@@ -97,3 +97,74 @@ jobs:
           fi
 
           echo "OK silence=${SILENCE}s mac_alive=${MAC_ALIVE}"
+
+  laptop-heartbeat:
+    # 윈도우 노트북 생존 감시 (dead-man's switch).
+    # 노트북 watchdog(10분 주기)이 laptop-heartbeat 브랜치에 타임스탬프를 force-push한다.
+    # 노트북이 hang/전원차단/BSOD면 push가 멈추고 → 여기서 stale을 감지해 알린다.
+    # 노트북 스스로는 자기 죽음을 알릴 수 없으므로(감시자가 감시 대상 위에 산다) 외부에서 본다.
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      REPO: ${{ github.repository }}
+      HB_BRANCH: laptop-heartbeat
+      MAX_STALE_SEC: "2700"   # 45분 (노트북 워치독 10분 주기 + 여유. 재부팅/일시 네트워크 흡수)
+    steps:
+      - name: Check laptop heartbeat staleness
+        shell: bash
+        run: |
+          set -uo pipefail
+          NOW=$(date +%s)
+          NOW_ISO=$(date -u '+%Y-%m-%d %H:%M:%S')
+
+          # laptop-heartbeat 브랜치의 마지막 커밋 committer date (없으면 아직 미배포 → 스킵)
+          DATE_ISO=$(gh api "repos/${REPO}/branches/${HB_BRANCH}" \
+                       --jq '.commit.commit.committer.date' 2>/dev/null || echo "")
+          if [ -z "$DATE_ISO" ]; then
+            echo "laptop-heartbeat 브랜치 없음 — 아직 첫 heartbeat 전 (스킵)"
+            exit 0
+          fi
+
+          LAST=$(date -u -d "$DATE_ISO" +%s 2>/dev/null || echo 0)
+          STALE=$((NOW - LAST))
+          echo "last=${DATE_ISO} stale=${STALE}s (임계 ${MAX_STALE_SEC}s)"
+
+          if [ "$LAST" -gt 0 ] && [ "$STALE" -le "$MAX_STALE_SEC" ]; then
+            echo "OK — 노트북 생존"
+            exit 0
+          fi
+
+          # 도배 방지(상태 없는 dedup): 임계 초과 후에는 MAX_STALE_SEC(45분)마다 한 번만 알린다.
+          # 5분 cron이 45분 경계의 앞 10분 창에 걸릴 때만 발송 → 노트북이 계속 죽어 있어도
+          # 약 45분 간격으로 1개. 창을 10분(cron 지연 흡수)으로 잡되, 창 내 최초 실행만 보내려
+          # 5분 미만 구간으로 한정해 45분당 정확히 1회에 수렴시킨다.
+          WINDOW=$((STALE % MAX_STALE_SEC))
+          if [ "$WINDOW" -ge 300 ]; then
+            echo "이번 45분 주기엔 이미 알림(또는 경계 밖) — 스킵 (window=${WINDOW}s)"
+            exit 0
+          fi
+
+          MIN=$((STALE / 60))
+          TEXT=$(printf '%s' \
+            "🔴 <b>윈도우 노트북 응답 없음</b>"$'\n\n' \
+            "마지막 heartbeat: <i>${MIN}분 전</i> (${DATE_ISO})"$'\n' \
+            "임계값: $((MAX_STALE_SEC/60))분"$'\n' \
+            "감지: ${NOW_ISO} UTC"$'\n\n' \
+            "노트북 워치독이 멈췄습니다 = 모든 자동화(재고연동/주문관리/자동등록/영수증)가"$'\n' \
+            "동시에 정지했을 수 있습니다."$'\n\n' \
+            "<b>점검:</b>"$'\n' \
+            "• 노트북 전원/절전 상태"$'\n' \
+            "• 부팅 후 자동로그인 됐는지"$'\n' \
+            "• Task Scheduler ForYouBuying\\Watchdog 활성 여부")
+          curl -sS -m 15 "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "disable_web_page_preview=true" \
+            --data-urlencode "text=${TEXT}" \
+            -o /dev/null -w "telegram_http=%{http_code}\n"
+          echo "alerted stale=${STALE}s"
