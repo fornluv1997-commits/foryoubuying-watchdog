@@ -2,7 +2,10 @@ name: SMS Gateway External Watchdog
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    # 30-minute cadence (2026-08-25): the 5-minute cron burned ~60% of the
+    # monthly free Actions quota and blocked CI account-wide on 08/24.
+    # MAX_SILENCE_SEC is already 1800, so a 30m probe matches the design.
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 concurrency:
