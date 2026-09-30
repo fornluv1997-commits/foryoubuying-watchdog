@@ -1,11 +1,15 @@
 name: SMS Gateway External Watchdog
 
+# 외부 감시 (2026-09-30 개편):
+# - 알림을 보내지 않는다. 결과는 run 결론(실패=어떤 검사가 exit 1)과 step 이름으로 남는다.
+# - 메인 PC 의 아침 산출물 판정(scripts/gh_watchdog_check.py, OutcomeMonitor 09:20)이
+#   지난 24시간 run·job API 를 읽어 대시보드 카드로 올린다.
+# - step 이름(sms-server / mac-heartbeat / laptop-heartbeat)이 판정 키다. 바꾸면 그쪽도 같이 바꿀 것.
 on:
   schedule:
-    # 30-minute cadence (2026-08-25): the 5-minute cron burned ~60% of the
-    # monthly free Actions quota and blocked CI account-wide on 08/24.
-    # MAX_SILENCE_SEC is already 1800, so a 30m probe matches the design.
-    - cron: '*/30 * * * *'
+    # 매시 1회: 두 잡을 한 잡으로 합쳐 무료 한도(private 2,000분/월) 안에 둔다.
+    # 9/20~ 한도 초과(결제 차단)로 전 run 미실행이었다. 정시(:00)는 GitHub 혼잡 시간이라 :17.
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -20,154 +24,72 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     env:
-      BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       SERVER_URL: ${{ secrets.SERVER_URL }}
-      MAX_SILENCE_SEC: "1800"
+      MAX_SILENCE_SEC: "1800"   # 맥 heartbeat 침묵 임계(30분)
       DOWN_RETRIES: "3"
       DOWN_BACKOFF_SEC: "10"
     steps:
-      - name: Probe /health with retry
-        id: probe
+      - name: sms-server
+        id: sms
         shell: bash
         run: |
           set +e
           RESP="000"
-          BODY=""
           for i in $(seq 1 "$DOWN_RETRIES"); do
-            RESP=$(curl -sS -m 15 -o /tmp/body.json -w "%{http_code}" "$SERVER_URL/health" 2>/dev/null)
-            if [ "$RESP" = "200" ]; then
-              BODY=$(cat /tmp/body.json)
-              break
-            fi
+            RESP=$(curl -sS -m 15 -o "$RUNNER_TEMP/health.json" -w "%{http_code}" "$SERVER_URL/health" 2>/dev/null)
+            [ "$RESP" = "200" ] && break
             echo "attempt $i: http=$RESP"
             sleep "$DOWN_BACKOFF_SEC"
           done
           echo "http_code=$RESP" >> "$GITHUB_OUTPUT"
-          echo "body=$BODY" >> "$GITHUB_OUTPUT"
+          if [ "$RESP" != "200" ]; then
+            MSG="FAIL sms-server: /health HTTP ${RESP} (${DOWN_RETRIES} tries)"
+            echo "$MSG"; echo "- $MSG" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "OK sms-server"
 
-      - name: Send Telegram alert if down or stale
+      - name: mac-heartbeat
+        # 서버가 죽었으면 맥 상태는 알 수 없다 → 실패가 아니라 skipped 로 남긴다.
+        if: always() && steps.sms.outputs.http_code == '200'
         shell: bash
-        env:
-          HTTP_CODE: ${{ steps.probe.outputs.http_code }}
-          BODY: ${{ steps.probe.outputs.body }}
         run: |
           set -euo pipefail
           NOW=$(date +%s)
-          NOW_ISO=$(date -u '+%Y-%m-%d %H:%M:%S')
-
-          send() {
-            local text="$1"
-            curl -sS -m 15 "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${CHAT_ID}" \
-              --data-urlencode "parse_mode=HTML" \
-              --data-urlencode "disable_web_page_preview=true" \
-              --data-urlencode "text=${text}" \
-              -o /dev/null -w "telegram_http=%{http_code}\n"
-          }
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            TEXT=$(printf '%s' \
-              "🔴 <b>Oracle SMS Gateway DOWN</b>"$'\n\n' \
-              "GET ${SERVER_URL}/health → HTTP <code>${HTTP_CODE}</code>"$'\n' \
-              "재시도 ${DOWN_RETRIES}회 모두 실패 (${DOWN_BACKOFF_SEC}초 간격)"$'\n' \
-              "감지: ${NOW_ISO} UTC"$'\n\n' \
-              "<b>점검:</b>"$'\n' \
-              "• <code>oci compute instance get --instance-id ...</code>"$'\n' \
-              "• <code>ssh opc@151.145.74.5</code>"$'\n' \
-              "• Oracle Console reboot (SOFTRESET → RESET)")
-            send "$TEXT"
-            exit 1
-          fi
-
-          LAST_HB=$(echo "$BODY" | jq -r '.last_heartbeat // 0')
-          MAC_ALIVE=$(echo "$BODY" | jq -r '.mac_alive // false')
+          LAST_HB=$(jq -r '.last_heartbeat // 0' "$RUNNER_TEMP/health.json")
+          LAST_HB=${LAST_HB%.*}
+          MAC_ALIVE=$(jq -r '.mac_alive // false' "$RUNNER_TEMP/health.json")
           SILENCE=$((NOW - LAST_HB))
-
-          if [ "$LAST_HB" -gt 0 ] && [ "$SILENCE" -gt "$MAX_SILENCE_SEC" ]; then
-            MIN=$((SILENCE / 60))
-            TEXT=$(printf '%s' \
-              "🟡 <b>맥북 heartbeat 끊김</b>"$'\n\n' \
-              "침묵: <i>${MIN}분</i> (임계값 $((MAX_SILENCE_SEC/60))분)"$'\n' \
-              "mac_alive=${MAC_ALIVE}"$'\n' \
-              "감지: ${NOW_ISO} UTC"$'\n\n' \
-              "<b>점검:</b>"$'\n' \
-              "• 맥북 전원/이더넷"$'\n' \
-              "• <code>ssh fornl@10.228.2.2</code>"$'\n' \
-              "• <code>launchctl list | grep com.foryou</code>")
-            send "$TEXT"
+          if [ "$LAST_HB" -le 0 ] || [ "$SILENCE" -gt "$MAX_SILENCE_SEC" ]; then
+            MSG="FAIL mac-heartbeat: silence=$((SILENCE / 60))m last_heartbeat=${LAST_HB} mac_alive=${MAC_ALIVE}"
+            echo "$MSG"; echo "- $MSG" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+          echo "OK mac-heartbeat silence=${SILENCE}s mac_alive=${MAC_ALIVE}"
 
-          echo "OK silence=${SILENCE}s mac_alive=${MAC_ALIVE}"
-
-  laptop-heartbeat:
-    # 윈도우 노트북 생존 감시 (dead-man's switch).
-    # 노트북 watchdog(10분 주기)이 laptop-heartbeat 브랜치에 타임스탬프를 force-push한다.
-    # 노트북이 hang/전원차단/BSOD면 push가 멈추고 → 여기서 stale을 감지해 알린다.
-    # 노트북 스스로는 자기 죽음을 알릴 수 없으므로(감시자가 감시 대상 위에 산다) 외부에서 본다.
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    permissions:
-      contents: read
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      REPO: ${{ github.repository }}
-      HB_BRANCH: laptop-heartbeat
-      MAX_STALE_SEC: "2700"   # 45분 (노트북 워치독 10분 주기 + 여유. 재부팅/일시 네트워크 흡수)
-    steps:
-      - name: Check laptop heartbeat staleness
+      - name: laptop-heartbeat
+        # 윈도우 노트북 dead-man's switch: 노트북 워치독(10분 주기)이 laptop-heartbeat 브랜치에
+        # 타임스탬프를 force-push 한다. 커밋이 45분 넘게 낡았으면 실패.
+        if: always()
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HB_BRANCH: laptop-heartbeat
+          MAX_STALE_SEC: "2700"   # 45분 (워치독 10분 주기 + 재부팅·일시 네트워크 흡수)
         run: |
           set -uo pipefail
           NOW=$(date +%s)
-          NOW_ISO=$(date -u '+%Y-%m-%d %H:%M:%S')
-
-          # laptop-heartbeat 브랜치의 마지막 커밋 committer date (없으면 아직 미배포 → 스킵)
-          DATE_ISO=$(gh api "repos/${REPO}/branches/${HB_BRANCH}" \
-                       --jq '.commit.commit.committer.date' 2>/dev/null || echo "")
-          if [ -z "$DATE_ISO" ]; then
-            echo "laptop-heartbeat 브랜치 없음 — 아직 첫 heartbeat 전 (스킵)"
-            exit 0
+          if ! DATE_ISO=$(gh api "repos/${REPO}/branches/${HB_BRANCH}" --jq '.commit.commit.committer.date' 2>"$RUNNER_TEMP/gh.err"); then
+            MSG="FAIL laptop-heartbeat: branch query failed: $(head -c 200 "$RUNNER_TEMP/gh.err" | tr '\n' ' ')"
+            echo "$MSG"; echo "- $MSG" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
-
           LAST=$(date -u -d "$DATE_ISO" +%s 2>/dev/null || echo 0)
           STALE=$((NOW - LAST))
-          echo "last=${DATE_ISO} stale=${STALE}s (임계 ${MAX_STALE_SEC}s)"
-
-          if [ "$LAST" -gt 0 ] && [ "$STALE" -le "$MAX_STALE_SEC" ]; then
-            echo "OK — 노트북 생존"
-            exit 0
+          if [ "$LAST" -le 0 ] || [ "$STALE" -gt "$MAX_STALE_SEC" ]; then
+            MSG="FAIL laptop-heartbeat: last=${DATE_ISO:-none} stale=$((STALE / 60))m (limit $((MAX_STALE_SEC / 60))m)"
+            echo "$MSG"; echo "- $MSG" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
-
-          # 도배 방지(상태 없는 dedup): 임계 초과 후에는 MAX_STALE_SEC(45분)마다 한 번만 알린다.
-          # 5분 cron이 45분 경계의 앞 10분 창에 걸릴 때만 발송 → 노트북이 계속 죽어 있어도
-          # 약 45분 간격으로 1개. 창을 10분(cron 지연 흡수)으로 잡되, 창 내 최초 실행만 보내려
-          # 5분 미만 구간으로 한정해 45분당 정확히 1회에 수렴시킨다.
-          WINDOW=$((STALE % MAX_STALE_SEC))
-          if [ "$WINDOW" -ge 300 ]; then
-            echo "이번 45분 주기엔 이미 알림(또는 경계 밖) — 스킵 (window=${WINDOW}s)"
-            exit 0
-          fi
-
-          MIN=$((STALE / 60))
-          TEXT=$(printf '%s' \
-            "🔴 <b>윈도우 노트북 응답 없음</b>"$'\n\n' \
-            "마지막 heartbeat: <i>${MIN}분 전</i> (${DATE_ISO})"$'\n' \
-            "임계값: $((MAX_STALE_SEC/60))분"$'\n' \
-            "감지: ${NOW_ISO} UTC"$'\n\n' \
-            "노트북 워치독이 멈췄습니다 = 모든 자동화(재고연동/주문관리/자동등록/영수증)가"$'\n' \
-            "동시에 정지했을 수 있습니다."$'\n\n' \
-            "<b>점검:</b>"$'\n' \
-            "• 노트북 전원/절전 상태"$'\n' \
-            "• 부팅 후 자동로그인 됐는지"$'\n' \
-            "• Task Scheduler ForYouBuying\\Watchdog 활성 여부")
-          curl -sS -m 15 "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "disable_web_page_preview=true" \
-            --data-urlencode "text=${TEXT}" \
-            -o /dev/null -w "telegram_http=%{http_code}\n"
-          echo "alerted stale=${STALE}s"
+          echo "OK laptop-heartbeat last=${DATE_ISO} stale=${STALE}s"
